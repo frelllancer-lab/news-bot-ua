@@ -1,0 +1,30 @@
+name: Build EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller httpx aiosqlite python-dotenv trafilatura lxml_html_clean deep-translator telegraph
+      
+      - name: Build EXE
+        run: |
+          python -m PyInstaller --onefile --console --name "news-bot" --hidden-import dotenv --hidden-import aiosqlite --hidden-import httpx --hidden-import trafilatura --hidden-import lxml_html_clean --hidden-import lxml --hidden-import justext --hidden-import courlan --hidden-import htmldate --hidden-import dateparser --hidden-import tld --hidden-import deep_translator --hidden-import telegraph --collect-all trafilatura --collect-all lxml_html_clean --collect-all justext --collect-all courlan --collect-all htmldate --collect-all dateparser --collect-all deep_translator --collect-all telegraph news_bot.py
+      
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-bot
+          path: dist/news-bot.exe

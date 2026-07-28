@@ -1,0 +1,11 @@
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.log
+.env
+*.exe
+*.spec
+*.bat

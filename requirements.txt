@@ -1,0 +1,8 @@
+httpx
+aiosqlite
+python-dotenv
+trafilatura
+lxml_html_clean
+deep-translator
+telegraph
+apscheduler
