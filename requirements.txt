@@ -2,6 +2,7 @@ httpx
 aiosqlite
 python-dotenv
 trafilatura
+lxml
 lxml_html_clean
 deep-translator
 telegraph
