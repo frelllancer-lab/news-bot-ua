@@ -293,6 +293,9 @@ class NewsBot:
         else:
             text += "Деталі за посиланням нижче."
 
+        if config.GROUP_INVITE_LINK:
+            text += f"\n\n<a href=\"{config.GROUP_INVITE_LINK}\">Підписатися на групу</a>"
+
         return text
 
     async def send_news_batch(self, chat_id: int, news: list[NewsItem]):
