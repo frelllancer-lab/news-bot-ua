@@ -12,6 +12,7 @@ STORAGE_DIR.mkdir(exist_ok=True)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID", "")
 GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK", "")
 
 TWITTER_USERNAME = os.getenv("TWITTER_USERNAME", "")

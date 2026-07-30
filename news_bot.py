@@ -293,11 +293,8 @@ class NewsBot:
         else:
             text += ""
 
-        source_link = f'<a href="{item.url}">\U0001F517 {item.source}</a>'
-        text += f"\n\n{source_link}"
-
         if config.GROUP_INVITE_LINK:
-            text += f" | <a href=\"{config.GROUP_INVITE_LINK}\">\U0001F4CB Підписатися</a>"
+            text += f"\n\n<a href=\"{config.GROUP_INVITE_LINK}\">\U0001F4CB Підписатися</a>"
 
         return text
 
@@ -404,10 +401,10 @@ class NewsBot:
             while True:
                 await asyncio.sleep(1800)
                 try:
-                    chat_id = int(self.chat_id)
+                    group_id = int(config.GROUP_CHAT_ID) if config.GROUP_CHAT_ID else int(self.chat_id)
                     news = await self.fetch_news("all", limit=10)
                     if news:
-                        sent = await self.send_news_batch(chat_id, news)
+                        sent = await self.send_news_batch(group_id, news)
                         logger.info(f"Auto-posted {sent} news items")
                 except Exception as e:
                     logger.error(f"Auto-post error: {e}")
