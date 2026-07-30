@@ -81,6 +81,7 @@ class NewsBot:
         self.http = httpx.AsyncClient(follow_redirects=True, timeout=30, headers=HEADERS)
         self.telegraph = Telegraph()
         self.telegraph.create_account(short_name="NewsBot")
+        self._pending_news: dict[str, NewsItem] = {}
 
     async def _api(self, method: str, **kwargs) -> dict:
         async with httpx.AsyncClient(timeout=120) as client:
@@ -352,21 +353,93 @@ class NewsBot:
 
         return sent
 
+    async def _post_to_group(self, item: NewsItem) -> bool:
+        group_id = int(config.GROUP_CHAT_ID) if config.GROUP_CHAT_ID else int(self.chat_id)
+        text = self._format_news_text(item)
+
+        try:
+            if item.image_url:
+                async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+                    img_resp = await client.get(item.image_url)
+                    if img_resp.status_code == 200:
+                        ct = img_resp.headers.get("content-type", "")
+                        if "image" in ct:
+                            async with httpx.AsyncClient(timeout=60) as up:
+                                resp = await up.post(
+                                    f"{self.api}/sendPhoto",
+                                    data={
+                                        "chat_id": group_id,
+                                        "caption": text[:1024],
+                                        "parse_mode": "HTML",
+                                    },
+                                    files={"photo": ("news.jpg", img_resp.content, "image/jpeg")},
+                                )
+                            if len(text) > 1024:
+                                remaining = text[1024:]
+                                chunks = [remaining[i:i+4000] for i in range(0, len(remaining), 4000)]
+                                for chunk in chunks:
+                                    await self._send_text(group_id, chunk)
+                                    await asyncio.sleep(0.3)
+                            return True
+
+            await self._send_text(group_id, text)
+            return True
+        except Exception as e:
+            logger.error(f"Group post error: {e}")
+            return False
+
     async def handle_new_news(self, chat_id: int, category: str = "all"):
         await self._send_text(chat_id, "Завантажую новини...")
 
-        news = await self.fetch_news(category, limit=20)
+        news = await self.fetch_news(category, limit=10)
 
         if not news:
             await self._send_text(chat_id, "Не вдалося завантажити новини. Спробуй пізніше.")
             return
 
-        sent = await self.send_news_batch(chat_id, news)
+        batch_id = str(int(asyncio.get_event_loop().time()))
+        self._pending_news.update({f"{batch_id}_{i}": item for i, item in enumerate(news)})
 
-        if sent > 0:
-            await self._send_text(chat_id, f"Відправлено {sent} новин")
-        else:
-            await self._send_text(chat_id, "Нових новин поки немає")
+        lines = ["<b>📰 Виберіть новину для публікації в групу:</b>\n"]
+        keyboard = []
+        for i, item in enumerate(news):
+            title = item.title[:55] + "..." if len(item.title) > 55 else item.title
+            lines.append(f"{i+1}. {title}")
+            keyboard.append([{"text": f"✅ Постити #{i+1}", "callback_data": f"post_{batch_id}_{i}"}])
+
+        await self._api("sendMessage",
+            chat_id=chat_id,
+            text="\n".join(lines),
+            parse_mode="HTML",
+            reply_markup={"inline_keyboard": keyboard},
+        )
+
+    async def handle_callback(self, cq: dict):
+        data = cq.get("data", "")
+        chat_id = cq["message"]["chat"]["id"]
+        msg_id = cq["message"]["message_id"]
+
+        if data.startswith("post_"):
+            key = data[5:]
+            item = self._pending_news.pop(key, None)
+            if item:
+                await self._api("answerCallbackQuery", callback_query_id=cq["id"], text="Постимо в групу...")
+                success = await self._post_to_group(item)
+                if success:
+                    await self._api("editMessageText",
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        text=f"✅ Опубліковано в групу:\n<b>{item.title[:80]}</b>",
+                        parse_mode="HTML",
+                    )
+                    await self.db.save_post(
+                        meme_id=item.id, source=item.source,
+                        caption=item.title[:100], file_path="", telegram_msg_id=0,
+                    )
+                else:
+                    await self._api("answerCallbackQuery", callback_query_id=cq["id"], text="Помилка публікації!", show_alert=True)
+            else:
+                await self._api("answerCallbackQuery", callback_query_id=cq["id"], text="Новина вже недоступна", show_alert=True)
 
     async def handle_message(self, msg: dict):
         text = msg.get("text", "").lower().strip()
@@ -379,7 +452,7 @@ class NewsBot:
                 "/all - Україна + світ\n"
                 "/ukraine - тільки Україна\n"
                 "/world - тільки світ\n\n"
-                "Або напиши що завгодно - отримаєш свіжі новини"
+                "Після завантаження обери новину кнопкою ✅ Постити — вона піде в групу."
             )
             return
 
@@ -420,9 +493,10 @@ class NewsBot:
 
                 for update in resp.get("result", []):
                     self._offset = update["update_id"] + 1
-                    msg = update.get("message")
-                    if msg:
-                        asyncio.create_task(self.handle_message(msg))
+                    if "callback_query" in update:
+                        await self.handle_callback(update["callback_query"])
+                    elif "message" in update:
+                        asyncio.create_task(self.handle_message(update["message"]))
 
             except Exception as e:
                 logger.error(f"Polling error: {e}")
