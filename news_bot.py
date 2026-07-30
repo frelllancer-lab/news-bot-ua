@@ -283,7 +283,7 @@ class NewsBot:
                 telegraph_url = self._create_telegraph(item.title, clean)
                 if telegraph_url:
                     preview = clean[:350].rsplit(' ', 1)[0] + "..."
-                    text += preview + f"\n\nЧитати далі: {telegraph_url}"
+                    text += preview + f"\n\n<a href=\"{telegraph_url}\">Читати далі</a>"
                 else:
                     text += clean[:3500]
             else:
@@ -291,10 +291,13 @@ class NewsBot:
         elif item.summary:
             text += self._clean_text(item.summary)
         else:
-            text += "Деталі за посиланням нижче."
+            text += ""
+
+        source_link = f'<a href="{item.url}">\U0001F517 {item.source}</a>'
+        text += f"\n\n{source_link}"
 
         if config.GROUP_INVITE_LINK:
-            text += f"\n\n<a href=\"{config.GROUP_INVITE_LINK}\">Підписатися на групу</a>"
+            text += f" | <a href=\"{config.GROUP_INVITE_LINK}\">\U0001F4CB Підписатися</a>"
 
         return text
 
