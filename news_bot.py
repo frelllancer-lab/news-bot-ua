@@ -397,6 +397,20 @@ class NewsBot:
         await self.db.initialize()
         logger.info("NewsBot started, polling...")
 
+        async def auto_post():
+            while True:
+                await asyncio.sleep(1800)
+                try:
+                    chat_id = int(self.chat_id)
+                    news = await self.fetch_news("all", limit=10)
+                    if news:
+                        sent = await self.send_news_batch(chat_id, news)
+                        logger.info(f"Auto-posted {sent} news items")
+                except Exception as e:
+                    logger.error(f"Auto-post error: {e}")
+
+        asyncio.create_task(auto_post())
+
         while True:
             try:
                 resp = await self._api("getUpdates", offset=self._offset, timeout=30)
