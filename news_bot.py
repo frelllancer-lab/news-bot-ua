@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import random
 import re
@@ -32,7 +34,7 @@ class NewsItem:
     summary: str
     full_text: str
     url: str
-    image_url: str | None
+    image_urls: list[str]
     source: str
     published: str
 
@@ -113,43 +115,80 @@ class NewsBot:
 
             desc_clean = re.sub(r"<[^>]+>", "", desc)[:300]
 
-            image_url = None
+            image_urls: list[str] = []
             for media in item_el.iter():
                 tag = media.tag.lower()
-                if "url" in tag and ("image" in tag or "thumbnail" in tag):
-                    image_url = media.get("url")
-                    break
-                if media.tag == "media:content" and media.get("medium") == "image":
-                    image_url = media.get("url")
-                    break
-                if media.tag == "enclosure" and "image" in media.get("type", ""):
-                    image_url = media.get("url")
-                    break
+                url = media.get("url") or ""
+                if not url or not url.startswith(("http://", "https://")):
+                    continue
+                if "image" in tag or "thumbnail" in tag:
+                    image_urls.append(url)
+                elif media.tag == "media:content" and (media.get("medium") or "").lower() == "image":
+                    image_urls.append(url)
+                elif media.tag == "enclosure" and "image" in (media.get("type") or "").lower():
+                    image_urls.append(url)
 
-            if not image_url and "<img" in desc.lower():
-                match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', desc, re.IGNORECASE)
-                if match:
-                    image_url = match.group(1)
+            if not image_urls and "<img" in desc.lower():
+                for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', desc, re.IGNORECASE):
+                    src = m.group(1).replace("&amp;", "&")
+                    if src.startswith(("http://", "https://")):
+                        image_urls.append(src)
 
-            item_id = f"{source_name}_{hash(title)}"
+            seen_urls: set[str] = set()
+            dedup_urls: list[str] = []
+            for u in image_urls:
+                if u not in seen_urls:
+                    seen_urls.add(u)
+                    dedup_urls.append(u)
+
+            item_id = f"{source_name}_{hashlib.md5(title.encode('utf-8')).hexdigest()}"
             items.append(NewsItem(
                 id=item_id,
                 title=title,
                 summary=desc_clean,
                 full_text="",
                 url=link,
-                image_url=image_url,
+                image_urls=dedup_urls[:10],
                 source=source_name,
                 published=pub,
             ))
 
         return items
 
-    async def fetch_full_text(self, url: str) -> str:
+    IMAGE_BLOCK_KEYWORDS = (
+        "logo", "loader", "spinner", "icon", "avatar", "placeholder", "banner",
+        "counter", "matomo", "pixel", "analytics", "advert", "google-analytics",
+        "googletagmanager", "doubleclick", "facebook.net", "gravatar", "w3.org",
+    )
+
+    def _extract_images_from_html(self, html: str, existing: list[str]) -> list[str]:
+        result = list(existing)
+        seen = set(result)
+        patterns = [
+            r'<img[^>]+src=["\']([^"\']+)["\']',
+            r'background(?:-image)?:\s*url\(["\']?([^"\')]+)["\']?\)',
+            r'<source[^>]+srcset=["\']([^"\']+)["\']',
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, html, re.IGNORECASE):
+                src = m.group(1).replace("&amp;", "&").strip().split(" ")[0]
+                if not src.startswith(("http://", "https://")):
+                    continue
+                low = src.lower()
+                if any(k in low for k in self.IMAGE_BLOCK_KEYWORDS):
+                    continue
+                if low.endswith((".svg", ".gif")) or ".svg" in low:
+                    continue
+                if src not in seen:
+                    seen.add(src)
+                    result.append(src)
+        return result[:10]
+
+    async def fetch_article(self, url: str) -> tuple[str, list[str]]:
         try:
             resp = await self.http.get(url)
             if resp.status_code != 200:
-                return ""
+                return "", []
             extracted = trafilatura.extract(
                 resp.text,
                 include_comments=False,
@@ -157,10 +196,11 @@ class NewsBot:
                 no_fallback=False,
                 favor_precision=False,
             )
-            return extracted or ""
+            images = self._extract_images_from_html(resp.text, [])
+            return (extracted or ""), images
         except Exception as e:
             logger.debug(f"Full text fetch failed for {url}: {e}")
-            return ""
+            return "", []
 
     def _translate_text(self, text: str, source: str) -> str:
         if source not in EN_SOURCES or not text:
@@ -219,7 +259,11 @@ class NewsBot:
         logger.info(f"Fetched {len(unique)} news items, fetching full text...")
 
         for item in unique[:limit + 5]:
-            item.full_text = await self.fetch_full_text(item.url)
+            item.full_text, html_images = await self.fetch_article(item.url)
+            for u in html_images:
+                if u not in item.image_urls:
+                    item.image_urls.append(u)
+            item.image_urls = item.image_urls[:10]
             self._translate_item(item)
             await asyncio.sleep(0.3)
 
@@ -262,13 +306,23 @@ class NewsBot:
         paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
         return [{"tag": "p", "children": [p]} for p in paragraphs]
 
-    def _create_telegraph(self, title: str, content: str) -> str | None:
+    def _create_telegraph(self, title: str, content: str, images: list[str] | None = None) -> str | None:
         try:
+            elements: list[dict] = []
             paragraphs = self._text_to_paragraphs(content)
+            if images:
+                step = max(2, len(paragraphs) // max(1, len(images)))
+                for i, p in enumerate(paragraphs):
+                    elements.append(p)
+                    if images and i > 0 and i % step == 0:
+                        img = images[(i // step) % len(images)]
+                        elements.append({"tag": "img", "attrs": {"src": img}})
+            else:
+                elements.extend(paragraphs)
             resp = self.telegraph.create_page(
                 title=title[:256],
                 author_name="NewsBot",
-                content=paragraphs,
+                content=elements,
             )
             return resp["url"]
         except Exception as e:
@@ -281,7 +335,7 @@ class NewsBot:
         if item.full_text:
             clean = self._clean_text(item.full_text)
             if len(clean) > 400:
-                telegraph_url = self._create_telegraph(item.title, clean)
+                telegraph_url = self._create_telegraph(item.title, clean, item.image_urls[:5])
                 if telegraph_url:
                     preview = clean[:350].rsplit(' ', 1)[0] + "..."
                     text += preview + f"\n\n<a href=\"{telegraph_url}\">Читати далі</a>"
@@ -299,6 +353,52 @@ class NewsBot:
 
         return text
 
+    async def _send_news_message(self, chat_id: int, text: str, title: str, image_urls: list[str]) -> bool:
+        images: list[bytes] = []
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+                for url in image_urls[:10]:
+                    try:
+                        resp = await client.get(url)
+                        if resp.status_code == 200 and "image" in resp.headers.get("content-type", ""):
+                            images.append(resp.content)
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"Image fetch error: {e}")
+
+        if len(images) == 1:
+            async with httpx.AsyncClient(timeout=60) as up:
+                resp = await up.post(
+                    f"{self.api}/sendPhoto",
+                    data={"chat_id": chat_id, "caption": text[:1024], "parse_mode": "HTML"},
+                    files={"photo": ("news.jpg", images[0], "image/jpeg")},
+                )
+            if len(text) > 1024:
+                for i in range(1024, len(text), 4000):
+                    await self._send_text(chat_id, text[i:i+4000])
+                    await asyncio.sleep(0.3)
+            return True
+        elif len(images) > 1:
+            media = []
+            files = {}
+            for i, img in enumerate(images[:10]):
+                media.append({"type": "photo", "media": f"attach://img{i}"})
+                files[f"img{i}"] = ("img.jpg", img, "image/jpeg")
+            media[0]["caption"] = f"<b>{title}</b>"
+            media[0]["parse_mode"] = "HTML"
+            async with httpx.AsyncClient(timeout=120) as up:
+                resp = await up.post(
+                    f"{self.api}/sendMediaGroup",
+                    data={"chat_id": chat_id, "media": json.dumps(media)},
+                    files=files,
+                )
+            await self._send_text(chat_id, text)
+            return True
+        else:
+            await self._send_text(chat_id, text)
+            return True
+
     async def send_news_batch(self, chat_id: int, news: list[NewsItem]):
         sent = 0
         for item in news:
@@ -308,93 +408,45 @@ class NewsBot:
             text = self._format_news_text(item)
 
             try:
-                if item.image_url:
-                    async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-                        img_resp = await client.get(item.image_url)
-                        if img_resp.status_code == 200:
-                            ct = img_resp.headers.get("content-type", "")
-                            if "image" in ct:
-                                async with httpx.AsyncClient(timeout=60) as up:
-                                    resp = await up.post(
-                                        f"{self.api}/sendPhoto",
-                                        data={
-                                            "chat_id": chat_id,
-                                            "caption": text[:1024],
-                                            "parse_mode": "HTML",
-                                        },
-                                        files={"photo": ("news.jpg", img_resp.content, "image/jpeg")},
-                                    )
-                                sent += 1
-                                await self.db.save_post(
-                                    meme_id=item.id, source=item.source,
-                                    caption=item.title[:100], file_path="", telegram_msg_id=0,
-                                )
-
-                                if item.full_text and len(text) > 1024:
-                                    remaining = text[1024:]
-                                    chunks = [remaining[i:i+4000] for i in range(0, len(remaining), 4000)]
-                                    for chunk in chunks:
-                                        await self._send_text(chat_id, chunk)
-                                        await asyncio.sleep(0.3)
-
-                                await asyncio.sleep(0.5)
-                                continue
-
-                await self._send_text(chat_id, text)
-                sent += 1
-                await self.db.save_post(
-                    meme_id=item.id, source=item.source,
-                    caption=item.title[:100], file_path="", telegram_msg_id=0,
-                )
-                await asyncio.sleep(0.3)
+                ok = await self._send_news_message(chat_id, text, item.title, item.image_urls)
+                if ok:
+                    sent += 1
+                    await self.db.save_post(
+                        meme_id=item.id, source=item.source,
+                        caption=item.title[:100], file_path="", telegram_msg_id=0,
+                    )
+                    await asyncio.sleep(0.5)
 
             except Exception as e:
                 logger.error(f"Send error: {e}")
 
         return sent
 
-    async def _post_to_group(self, item: NewsItem) -> bool:
+    async def _post_to_group(self, item: NewsItem) -> str:
         group_id = int(config.GROUP_CHAT_ID) if config.GROUP_CHAT_ID else int(self.chat_id)
+        if await self.db.is_already_posted(item.id):
+            return "duplicate"
         text = self._format_news_text(item)
-
         try:
-            if item.image_url:
-                async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-                    img_resp = await client.get(item.image_url)
-                    if img_resp.status_code == 200:
-                        ct = img_resp.headers.get("content-type", "")
-                        if "image" in ct:
-                            async with httpx.AsyncClient(timeout=60) as up:
-                                resp = await up.post(
-                                    f"{self.api}/sendPhoto",
-                                    data={
-                                        "chat_id": group_id,
-                                        "caption": text[:1024],
-                                        "parse_mode": "HTML",
-                                    },
-                                    files={"photo": ("news.jpg", img_resp.content, "image/jpeg")},
-                                )
-                            if len(text) > 1024:
-                                remaining = text[1024:]
-                                chunks = [remaining[i:i+4000] for i in range(0, len(remaining), 4000)]
-                                for chunk in chunks:
-                                    await self._send_text(group_id, chunk)
-                                    await asyncio.sleep(0.3)
-                            return True
-
-            await self._send_text(group_id, text)
-            return True
+            ok = await self._send_news_message(group_id, text, item.title, item.image_urls)
+            return "ok" if ok else "error"
         except Exception as e:
             logger.error(f"Group post error: {e}")
-            return False
+            return "error"
 
     async def handle_new_news(self, chat_id: int, category: str = "all"):
         await self._send_text(chat_id, "Завантажую новини...")
 
-        news = await self.fetch_news(category, limit=10)
+        news = await self.fetch_news(category, limit=20)
+
+        fresh = []
+        for n in news:
+            if not await self.db.is_already_posted(n.id):
+                fresh.append(n)
+        news = fresh[:10]
 
         if not news:
-            await self._send_text(chat_id, "Не вдалося завантажити новини. Спробуй пізніше.")
+            await self._send_text(chat_id, "Свіжих новин поки немає.")
             return
 
         batch_id = str(int(asyncio.get_event_loop().time()))
@@ -424,8 +476,8 @@ class NewsBot:
             item = self._pending_news.pop(key, None)
             if item:
                 await self._api("answerCallbackQuery", callback_query_id=cq["id"], text="Постимо в групу...")
-                success = await self._post_to_group(item)
-                if success:
+                result = await self._post_to_group(item)
+                if result == "ok":
                     await self._api("editMessageText",
                         chat_id=chat_id,
                         message_id=msg_id,
@@ -436,6 +488,8 @@ class NewsBot:
                         meme_id=item.id, source=item.source,
                         caption=item.title[:100], file_path="", telegram_msg_id=0,
                     )
+                elif result == "duplicate":
+                    await self._api("answerCallbackQuery", callback_query_id=cq["id"], text="Ця новина вже опублікована", show_alert=True)
                 else:
                     await self._api("answerCallbackQuery", callback_query_id=cq["id"], text="Помилка публікації!", show_alert=True)
             else:
